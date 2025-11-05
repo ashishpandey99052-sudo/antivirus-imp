@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+Modern Antivirus Scanner (CustomTkinter)
+Author: ChatGPT (Educational Example)
+"""
+
+import os
+import sys
+import json
+import shutil
+import subprocess
+import datetime
+import platform
+import threading
+from pathlib import Path
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+
+# Optional ClamAV daemon
+try:
+    import clamd
+    USE_CLAMD = True
+except ImportError:
+    USE_CLAMD = False
+
+# Folders
+BASE_DIR = Path.cwd()
+REPORT_DIR = BASE_DIR / "av_reports"
+QUARANTINE_DIR = BASE_DIR / "quarantine"
+REPORT_DIR.mkdir(exist_ok=True)
+QUARANTINE_DIR.mkdir(exist_ok=True)
+
+# ---------------- SCANNING ---------------- #
+
+def now_iso():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def scan_with_clamd(path: str):
+    """Use ClamAV daemon (clamd) if available."""
+    try:
+        cd = clamd.ClamdUnixSocket()
+        cd.ping()
+    except Exception:
+        try:
+            cd = clamd.ClamdNetworkSocket()
+            cd.ping()
+        except Exception:
+            return {"status": "ERROR", "details": "Unable to connect to clamd"}
+
+    result = cd.scan(path)
+    if not result:
+        return {"status": "OK", "details": None}
+
+    res = result.get(path)
+    if not res:
+        return {"status": "OK", "details": None}
+    if res[0] == "FOUND":
+        return {"status": "INFECTED", "details": res[1]}
+    elif res[0] == "ERROR":
+        return {"status": "ERROR", "details": res[1]}
+    return {"status": "OK", "details": None}
+
+def scan_with_clamscan(path: str):
+    """Fallback: use clamscan."""
+    try:
+        proc = subprocess.run(
+            ["clamscan", "--infected", "--no-summary", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, check=False
+        )
+    except FileNotFoundError:
+        return {"status": "ERROR", "details": "clamscan not found on PATH"}
+
+    out = proc.stdout.strip()
+    if proc.returncode == 0:
+        return {"status": "OK", "details": None}
+    elif "FOUND" in out:
+        sig = out.split(":")[-1].replace("FOUND", "").strip()
+        return {"status": "INFECTED", "details": sig}
+    else:
+        return {"status": "ERROR", "details": out or proc.stderr}
+
+def scan_target(path: str):
+    if USE_CLAMD:
+        result = scan_with_clamd(path)
+        if result["status"] == "ERROR":
+            result = scan_with_clamscan(path)
+        return result
+    return scan_with_clamscan(path)
+
+def make_report(target, result, action):
+    timestamp = now_iso()
+    base_name = Path(target).name
+    report_base = REPORT_DIR / f"report_{base_name}_{timestamp.replace(':','-')}"
+    json_file = report_base.with_suffix(".json")
+    html_file = report_base.with_suffix(".html")
+
+    data = {
+        "timestamp": timestamp,
+        "target": str(target),
+        "scan_result": result,
+        "action_taken": action,
+        "system": platform.platform(),
+    }
+
+    with open(json_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+    html = f"""
+    <html><head><meta charset='utf-8'><title>Scan Report</title></head>
+    <body>
+    <h1>Scan Report - {base_name}</h1>
+    <p><b>Target:</b> {target}</p>
+    <p><b>Time:</b> {timestamp}</p>
+    <h2>Result:</h2>
+    <pre>{json.dumps(result, indent=2)}</pre>
+    <h2>Action:</h2>
+    <pre>{json.dumps(action, indent=2)}</pre>
+    </body></html>
+    """
+    with open(html_file, "w") as f:
+        f.write(html)
+
+    return json_file, html_file
+
+# ---------------- UI ---------------- #
+
+class ModernAntivirus(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("🛡️ Modern Antivirus Scanner")
+        self.geometry("800x600")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("green")
+
+        # Main frame
+        self.frame = ctk.CTkFrame(self, corner_radius=15)
+        self.frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(self.frame, text="Antivirus Scanner", font=("Helvetica", 24, "bold")).pack(pady=10)
+
+        # File selection
+        self.path_var = ctk.StringVar()
+        entry_frame = ctk.CTkFrame(self.frame)
+        entry_frame.pack(pady=10)
+        self.path_entry = ctk.CTkEntry(entry_frame, textvariable=self.path_var, width=500, placeholder_text="Select file or folder...")
+        self.path_entry.pack(side="left", padx=10)
+        ctk.CTkButton(entry_frame, text="Browse", command=self.choose_target).pack(side="left")
+
+        # Action buttons
+        btn_frame = ctk.CTkFrame(self.frame)
+        btn_frame.pack(pady=10)
+        ctk.CTkButton(btn_frame, text="🔍 Scan File", command=self.start_file_scan, width=150).grid(row=0, column=0, padx=10)
+        ctk.CTkButton(btn_frame, text="📂 Scan Folder", command=self.start_folder_scan, width=150).grid(row=0, column=1, padx=10)
+
+        # Progress
+        self.progress_label = ctk.CTkLabel(self.frame, text="")
+        self.progress_label.pack()
+        self.progressbar = ctk.CTkProgressBar(self.frame, width=400)
+        self.progressbar.set(0)
+        self.progressbar.pack(pady=10)
+
+        # Output log
+        self.textbox = ctk.CTkTextbox(self.frame, width=720, height=300, corner_radius=10)
+        self.textbox.pack(pady=10)
+        self.textbox.insert("end", "Ready.\n")
+        self.textbox.configure(state="disabled")
+
+        # Action bar
+        action_frame = ctk.CTkFrame(self.frame)
+        action_frame.pack(pady=10)
+        self.btn_quarantine = ctk.CTkButton(action_frame, text="🧩 Quarantine", state="disabled", command=self.quarantine)
+        self.btn_delete = ctk.CTkButton(action_frame, text="🗑️ Delete", state="disabled", command=self.delete_file)
+        self.btn_reports = ctk.CTkButton(action_frame, text="📄 Open Reports", command=self.open_reports)
+        self.btn_quarantine.grid(row=0, column=0, padx=10)
+        self.btn_delete.grid(row=0, column=1, padx=10)
+        self.btn_reports.grid(row=0, column=2, padx=10)
+
+        # Internals
+        self.last_path = None
+        self.last_result = None
+
+    # ---------- Helper methods ---------- #
+
+    def choose_target(self):
+        file = filedialog.askopenfilename(title="Select file")
+        if not file:
+            folder = filedialog.askdirectory(title="Select folder")
+            if folder:
+                self.path_var.set(folder)
+        else:
+            self.path_var.set(file)
+
+    def log(self, text):
+        self.textbox.configure(state="normal")
+        self.textbox.insert("end", text + "\n")
+        self.textbox.see("end")
+        self.textbox.configure(state="disabled")
+
+    def update_progress(self, value, total):
+        pct = value / total if total else 0
+        self.progressbar.set(pct)
+        self.progress_label.configure(text=f"Progress: {int(pct*100)}%")
+
+    # ---------- Scan logic ---------- #
+
+    def start_file_scan(self):
+        path = self.path_var.get().strip()
+        if not path:
+            messagebox.showwarning("Missing file", "Please choose a file first.")
+            return
+        threading.Thread(target=self.run_scan, args=(path,), daemon=True).start()
+
+    def start_folder_scan(self):
+        folder = filedialog.askdirectory(title="Select folder")
+        if folder:
+            self.path_var.set(folder)
+            threading.Thread(target=self.run_scan, args=(folder,), daemon=True).start()
+
+    def run_scan(self, target):
+        self.log(f"Started scanning: {target}")
+        self.progressbar.set(0)
+        self.btn_quarantine.configure(state="disabled")
+        self.btn_delete.configure(state="disabled")
+
+        if Path(target).is_dir():
+            files = [f for f in Path(target).rglob("*") if f.is_file()]
+            infected = []
+            total = len(files)
+            for i, f in enumerate(files, start=1):
+                res = scan_target(str(f))
+                if res["status"] == "INFECTED":
+                    infected.append((str(f), res["details"]))
+                    self.log(f"[INFECTED] {f} → {res['details']}")
+                elif res["status"] == "OK":
+                    self.log(f"[CLEAN] {f}")
+                else:
+                    self.log(f"[ERROR] {f} → {res['details']}")
+                self.update_progress(i, total)
+            result = {"status": "DONE", "infected": infected}
+        else:
+            result = scan_target(target)
+            self.update_progress(1, 1)
+            if result["status"] == "INFECTED":
+                self.log(f"[INFECTED] {target} → {result['details']}")
+            elif result["status"] == "OK":
+                self.log("[CLEAN] File is clean.")
+            else:
+                self.log(f"[ERROR] {result['details']}")
+
+        self.last_path = target
+        self.last_result = result
+        make_report(target, result, {"action": "none"})
+        self.log("📄 Report saved to ./av_reports/")
+        self.progress_label.configure(text="Scan complete ✅")
+
+        if "INFECTED" in str(result):
+            self.btn_quarantine.configure(state="normal")
+            self.btn_delete.configure(state="normal")
+
+    # ---------- Actions ---------- #
+
+    def quarantine(self):
+        if not self.last_path or not Path(self.last_path).exists():
+            messagebox.showerror("Error", "File not found.")
+            return
+        dest = QUARANTINE_DIR / f"{Path(self.last_path).name}.quarantine"
+        shutil.move(self.last_path, dest)
+        make_report(self.last_path, self.last_result, {"action": "quarantine", "dest": str(dest)})
+        self.log(f"🧩 File moved to quarantine: {dest}")
+        self.btn_quarantine.configure(state="disabled")
+        self.btn_delete.configure(state="disabled")
+
+    def delete_file(self):
+        if not self.last_path or not Path(self.last_path).exists():
+            messagebox.showerror("Error", "File not found.")
+            return
+        if messagebox.askyesno("Delete", f"Delete {self.last_path}? This cannot be undone."):
+            os.remove(self.last_path)
+            make_report(self.last_path, self.last_result, {"action": "deleted"})
+            self.log(f"🗑️ File deleted: {self.last_path}")
+            self.btn_quarantine.configure(state="disabled")
+            self.btn_delete.configure(state="disabled")
+
+    def open_reports(self):
+        if platform.system() == "Windows":
+            os.startfile(REPORT_DIR)
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", REPORT_DIR])
+        else:
+            subprocess.run(["xdg-open", REPORT_DIR])
+
+
+if __name__ == "__main__":
+    app = ModernAntivirus()
+    app.mainloop()
